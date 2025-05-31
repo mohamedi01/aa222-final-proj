@@ -26,6 +26,7 @@ route_df = route_df.sort_values("Segment_ID").reset_index(drop=True)
 B_MAX   = 80   # kWh pack size
 B_MIN   = 1   # kWh reserve
 B_START = 80   # kWh initial
+PENALTY = 1e5              # $ penalty factor for SoC violations
 
 # --- Base consumption and adjustment factors -----------------------------------
 BASE_KWH_PER_MILE = 0.25   # flat road, 60 mph, 70 °F, no HVAC
@@ -36,23 +37,41 @@ TEMP_SLOPE   = 0.006       # +0.6 % energy per |Δ°F|
 SPEED_REF_MPH = 60         # aerodynamic drag reference (mph)
 SPEED_QUAD    = 0.002      # +0.2 % per (Δ mph)^2
 
-ELEV_COEFF = 0.00003       # kWh per ft climbed per mile (rough regen‑ignored)
+ELEV_UP_COEFF = 0.0003       # kWh per ft climbed per mile (rough regen‑ignored)
+ELEV_REGEN_EFF = 0.60      # 60 % of uphill cost comes back on descent
+# Regenerative braking ---------------------------------------------
+TRAFFIC_SEED = 27                              # reproducible randomness
+REGEN_KWH_PER_MILE_AT_FULL_STOPGO = 0.05       # kWh/mi recovered at traffic=1
 
-PENALTY = 1e5              # $ penalty factor for SoC violations
+if "Traffic_Intensity" in route_df.columns:
+    traffic_profile = route_df["Traffic_Intensity"].clip(0, 1).values.astype(float)
+else:
+    rng = np.random.default_rng(TRAFFIC_SEED)
+    traffic_profile = rng.uniform(0.1, 0.7, size=len(route_df))  # moderate traffic range
+    route_df["Traffic_Intensity"] = traffic_profile  # keep for inspection
 
 def energy_per_mile(row) -> float:
-    """Return kWh/mile for this segment based on temp, speed and elevation."""
+    """Return kWh/mile adjusted for temp, speed, elevation, *and regen*."""
     # Temperature adjustment (HVAC + chemistry)
     temp_factor = TEMP_SLOPE * abs(row["Avg_Temp_F"] - TEMP_REF_F)
 
-    # Speed adjustment (aero) – quadratic around 60 mph
+    # Speed adjustment (aero)
     speed_factor = SPEED_QUAD * (row["Speed_limit"] - SPEED_REF_MPH) ** 2
 
-    # Elevation adjustment – only climbing costs, ignore regen on descent
-    elev_gain_ft = max(row["Elevation_Change_ft"], 0.0)
-    elev_factor  = elev_gain_ft * ELEV_COEFF
+    # Elevation cost (climb and fall to model energy spent and regen)
+    elev_change_ft = row["Elevation_Change_ft"]      # can be + or –
+    if elev_change_ft >= 0:
+        elev_factor = elev_change_ft * ELEV_UP_COEFF
+    else:
+        elev_factor = elev_change_ft * ELEV_UP_COEFF * ELEV_REGEN_EFF
+    # print(elev_factor)
 
-    return BASE_KWH_PER_MILE * (1 + temp_factor + speed_factor) + elev_factor
+    # Regenerative braking benefit (subtractive term)
+    traffic_intensity = row["Traffic_Intensity"]
+    regen_benefit = REGEN_KWH_PER_MILE_AT_FULL_STOPGO * traffic_intensity
+
+    # Ensure we never go below some tiny positive value
+    return max(0, BASE_KWH_PER_MILE * (1 + temp_factor + speed_factor) + elev_factor - regen_benefit)
 
 # Compute per‑segment energy usage vector ---------------------------------------
 E_used_seg = route_df.apply(lambda r: energy_per_mile(r) * r["Distance_mi"], axis=1).values
