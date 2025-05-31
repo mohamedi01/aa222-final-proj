@@ -1,0 +1,5 @@
+Segment_ID,Station_Name,Price_per_kWh,Max_Charge_Rate_kW
+4,Station_4,0.3,50
+8,Station_8,0.45,50
+1,Station_1,0.33,50
+7,Station_7,0.31,50

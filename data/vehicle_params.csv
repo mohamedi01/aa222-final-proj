@@ -1,0 +1,7 @@
+Param,Value
+Initial_Battery_kWh,75.0
+Battery_Capacity_kWh,100.0
+Min_Battery_kWh,10.0
+Efficiency_kWh_per_mi,0.3
+Max_Speed_mph,70.0
+Min_Speed_mph,50.0
