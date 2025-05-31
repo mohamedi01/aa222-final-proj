@@ -121,10 +121,10 @@ def total_cost(q: np.ndarray) -> float:
         elif battery > B_MAX:
             cost += PENALTY * (battery - B_MAX)
 
-        charging_time = np.sum(q / max_rate_kw)
+    charging_time = np.sum(q / max_rate_kw)
 
-        # Add squared charging time penalty
-        cost += TIME_PENALTY * charging_time**2
+    # Add squared charging time penalty
+    cost += TIME_PENALTY * charging_time**2
 
     return cost
 
