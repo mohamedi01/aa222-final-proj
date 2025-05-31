@@ -26,6 +26,8 @@ route_df = route_df.sort_values("Segment_ID").reset_index(drop=True)
 B_MAX   = 80   # kWh pack size
 B_MIN   = 35   # kWh reserve
 B_START = 50   # kWh initial
+TIME_PENALTY = 1000 
+TIME_MAX = 1
 
 energy_per_mile = 0.25
 
@@ -38,7 +40,7 @@ num_stations     = len(stations_df)
 prices      = stations_df["Price_per_kWh"].values
 max_rate_kw = stations_df["Max_Charge_Rate_KW"].values if "Max_Charge_Rate_KW" in stations_df.columns else stations_df["Max_Charge_Rate_kW"].values  # handle column naming
 
-bounds = [(0.0, 4.0 * r) for r in max_rate_kw]  # 4‑hour cap per stop
+bounds = [(0.0, TIME_MAX * r) for r in max_rate_kw]  # 4‑hour cap per stop
 
 # Quick feasibility: even if we charge to the upper bound everywhere, does the
 # battery remain above B_MIN?
@@ -76,6 +78,11 @@ def total_cost(q: np.ndarray) -> float:
             cost += PENALTY * (B_MIN - battery)
         elif battery > B_MAX:
             cost += PENALTY * (battery - B_MAX)
+
+        charging_time = np.sum(q / max_rate_kw)
+
+        # Add squared charging time penalty
+        cost += TIME_PENALTY * charging_time**2
 
     return cost
 
