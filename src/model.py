@@ -27,6 +27,7 @@ B_MAX   = 80   # kWh pack size
 B_MIN   = 1   # kWh reserve
 B_START = 80   # kWh initial
 PENALTY = 1e5              # $ penalty factor for SoC violations
+TIME_PENALTY = 1000
 
 # --- Base consumption and adjustment factors -----------------------------------
 BASE_KWH_PER_MILE = 0.25   # flat road, 60 mph, 70 °F, no HVAC
@@ -119,6 +120,11 @@ def total_cost(q: np.ndarray) -> float:
             cost += PENALTY * (B_MIN - battery)
         elif battery > B_MAX:
             cost += PENALTY * (battery - B_MAX)
+
+        charging_time = np.sum(q / max_rate_kw)
+
+        # Add squared charging time penalty
+        cost += TIME_PENALTY * charging_time**2
 
     return cost
 
