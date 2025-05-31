@@ -2,61 +2,73 @@ import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
 
-# Load your CSV files
-stations_df = pd.read_csv("charging_stations.csv")
-route_df = pd.read_csv("route_segments.csv")
+# ---- LOAD DATA -------------------------------------------------------------
+stations_df = pd.read_csv("../data/charging_stations.csv")
+route_df    = pd.read_csv("../data/route_segments.csv")
 
-# Constants
-B_max = 80       # max battery kWh
-B_min = 10       # min battery kWh at end
-B_start = 20     # starting battery kWh
+# ---- VEHICLE CONSTANTS -----------------------------------------------------
+B_MAX   = 80   # kWh capacity
+B_MIN   = 10   # kWh required at arrival
+B_START = 20   # kWh at departure
 
-# Calculate total energy needed for route (approximate)
-energy_per_mile = 0.25  # kWh per mile
-total_energy_needed = np.sum(route_df['Distance_mi']) * energy_per_mile  # kWh
+# For brevity we keep constant efficiency. Plug in your dynamic model if needed.
+energy_per_mile = 0.25
+total_energy_needed = route_df["Distance_mi"].sum() * energy_per_mile
 
-# Decision variables: amount charged at each station (kWh)
+# ---- DECISION VECTOR -------------------------------------------------------
 num_stations = len(stations_df)
-prices = stations_df['Price_per_kWh'].values
-max_charge = stations_df['Max_Charge_Rate_kW'].values  # max charge per station (assuming max 1 hour charge)
+prices       = stations_df["Price_per_kWh"].values
+max_charge   = stations_df["Max_Charge_Rate_kW"].values
 
-# Objective function with penalty for constraints
-def objective(x):
-    # Cost = sum of (energy charged * price)
-    cost = np.dot(x, prices)
-    
-    penalty = 0
-    total_charge = np.sum(x)
-    battery_end = B_start + total_charge - total_energy_needed
-    
-    # Penalty for violating minimum battery left at end of trip
-    if battery_end < B_min:
-        penalty += 1e6 * (B_min - battery_end)**2
-    
-    # Penalty for exceeding max battery capacity
-    if (B_start + total_charge) > B_max:
-        penalty += 1e6 * ((B_start + total_charge) - B_max)**2
-    
-    # Penalty for charging more than max charging rate at any station
-    for i in range(num_stations):
-        if x[i] < 0:
-            penalty += 1e6 * (abs(x[i]))**2
-        if x[i] > max_charge[i]:
-            penalty += 1e6 * (x[i] - max_charge[i])**2
-    
-    return cost + penalty
+# ---- LEAST‑SQUARES OBJECTIVE ----------------------------------------------
+# Minimise sum_i ( sqrt(price_i) * q_i )^2  =  q^T diag(price) q
+# which is a quadratic surrogate of the true linear cost.
+def objective_ls(q):
+    return np.dot(prices, q ** 2)  # Σ price_i * q_i^2
 
-# Initial guess: zero charge at all stations
-x0 = np.zeros(num_stations)
+# ---- CONSTRAINTS -----------------------------------------------------------
 
-# Run Nelder-Mead
-result = minimize(objective, x0, method='Nelder-Mead', options={'maxiter':10000, 'disp': True})
+def soc_min(q):
+    """State of charge at arrival minus required minimum (≥ 0)."""
+    return B_START + q.sum() - total_energy_needed - B_MIN
 
-if result.success:
-    print("Optimal charging amounts at stations:")
-    for i, station in stations_df.iterrows():
-        print(f"{station['Station_Name']} (Segment {station['Segment_ID']}): {result.x[i]:.2f} kWh")
-    total_cost = np.dot(result.x, prices)
-    print(f"Total charging cost: ${total_cost:.2f}")
+def soc_cap(q):
+    """Remaining battery capacity at end of charging (≥ 0)."""
+    return B_MAX - (B_START + q.sum())
+
+constraints = [
+    {"type": "ineq", "fun": soc_min},
+    {"type": "ineq", "fun": soc_cap},
+]
+
+bounds = [(0, mc) for mc in max_charge]
+
+# ---- SOLVE WITH SLSQP ------------------------------------------------------
+q0 = np.zeros(num_stations)
+res = minimize(
+    objective_ls,
+    q0,
+    method="SLSQP",
+    bounds=bounds,
+    constraints=constraints,
+    options={"disp": True, "maxiter": 10000},
+)
+
+if res.success:
+    print("\nOptimal charging plan (least‑squares cost):")
+    for qi, (_, row) in zip(res.x, stations_df.iterrows()):
+        print(f"{row['Station_Name']} (Segment {int(row['Segment_ID'])}): {qi:.2f} kWh")
+    ls_cost   = objective_ls(res.x)
+    lin_cost  = np.dot(res.x, prices)
+    batt_end  = B_START + res.x.sum() - total_energy_needed
+    print(f"\nLeast‑squares objective value: {ls_cost:.4f}")
+    print(f"Corresponding linear cost      : ${lin_cost:.2f}")
+    print(f"Battery at arrival: {batt_end:.2f} kWh (min {B_MIN} kWh)")
 else:
-    print("Optimization failed:", result.message)
+    ls_cost   = objective_ls(res.x)
+    lin_cost  = np.dot(res.x, prices)
+    batt_end  = B_START + res.x.sum() - total_energy_needed
+    print(f"\nLeast‑squares objective value: {ls_cost:.4f}")
+    print(f"Corresponding linear cost      : ${lin_cost:.2f}")
+    print(f"Battery at arrival: {batt_end:.2f} kWh (min {B_MIN} kWh)")
+    raise RuntimeError("Optimization failed: " + res.message)
