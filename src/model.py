@@ -13,6 +13,9 @@ import numpy as np
 from scipy.optimize import minimize
 from collections import defaultdict
 
+cost_trace = []
+q_trace = []
+
 # ────────────────────────────────────────────────────────────────────────────────
 # 1.  Load data
 # ────────────────────────────────────────────────────────────────────────────────
@@ -105,12 +108,15 @@ def total_cost(q: np.ndarray) -> float:
             cost += PENALTY * (battery - B_MAX)
 
     cost += TIME_PENALTY * (np.sum(q / max_rate_kw)) ** 2
+    cost_trace.append(cost)
+    q_trace.append(q.copy())
     return cost
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 7.  Optimisation (SLSQP)
 # ────────────────────────────────────────────────────────────────────────────────
-res = minimize(total_cost, np.zeros(num_stations), method="SLSQP", bounds=bounds, options={"disp": True, "maxiter": 2_000})
+res = minimize(total_cost, np.zeros(num_stations), 
+               method="SLSQP", bounds=bounds, options={"disp": True, "maxiter": 50, "ftol":1e-5})
 if not res.success:
     raise RuntimeError("Optimization failed: " + res.message)
 q_opt = res.x
@@ -136,3 +142,45 @@ print("SoC after each segment (kWh):", np.round(soc_trace, 2))
 print("Energy per segment (kWh):", [f"{e:.2f}" for e in E_used_seg])
 print("Energy per mile for each segment (kWh/mi):", [f"{e:.3f}" for e in energy_per_mile_constants])
 assert min(soc_trace) >= B_MIN - 1e-5, "SoC dipped below reserve!"
+
+import matplotlib.pyplot as plt
+print(len(q_trace))
+print(len(cost_trace))
+
+plt.figure(figsize=(12, 12))
+# --- Plot objective function over iterations ---
+# plt.figure(figsize=(10, 4))
+plt.subplot(2, 1, 1)
+plt.plot(cost_trace, label="Objective Function")
+plt.xlabel("Iteration")
+plt.ylabel("Total Cost ($)")
+plt.title("Objective Function Value vs. Iteration")
+plt.grid(True)
+plt.legend()
+# plt.tight_layout()
+# plt.show()
+
+# --- Plot charge amount per station vs. iteration ---
+q_trace_arr = np.array(q_trace)  # shape: (iterations, num_stations)
+# plt.figure(figsize=(12, 6))
+plt.subplot(2, 1, 2)
+for i in range(q_trace_arr.shape[1]):
+    plt.plot(q_trace_arr[:, i], label=f"Station {i+1}")
+plt.xlabel("Iteration")
+plt.ylabel("Charge Amount (kWh)")
+plt.title("Charge Decisions vs. Iteration")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+#Log
+plt.figure(figsize=(10, 4))
+plt.plot(np.log(cost_trace), label="Objective Function")
+plt.xlabel("Iteration")
+plt.ylabel("Total Cost ($)")
+plt.title("Objective Function Value vs. Iteration")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
