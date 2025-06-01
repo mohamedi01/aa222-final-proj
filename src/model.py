@@ -12,6 +12,9 @@ import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
 
+cost_trace = []
+q_trace = []
+
 # ────────────────────────────────────────────────────────────────────────────────
 # 1.  Load data
 # ────────────────────────────────────────────────────────────────────────────────
@@ -97,6 +100,8 @@ max_possible_soc = B_START + np.cumsum(upper_energy_by_seg) - np.cumsum(E_used_s
 if max_possible_soc.min() < B_MIN:
     raise RuntimeError("Route infeasible: even max charging cannot keep SoC above reserve.")
 
+
+# q is the charge at each station
 # ────────────────────────────────────────────────────────────────────────────────
 # 3.  Objective with penalty AFTER charging
 # ────────────────────────────────────────────────────────────────────────────────
@@ -125,6 +130,8 @@ def total_cost(q: np.ndarray) -> float:
 
     # Add squared charging time penalty
     cost += TIME_PENALTY * charging_time**2
+    cost_trace.append(cost)
+    q_trace.append(q.copy())
 
     return cost
 
@@ -169,3 +176,31 @@ print("SoC after each segment (kWh):", np.round(soc_trace, 2))
 print("Energy per segment:", [f'{e:.2f}' for e in E_used_seg])
 print("Energy per mile for each segment:", [f'{e:.2f}' for e in energy_per_mile_constants])
 assert min(soc_trace) >= B_MIN - 1e-5, "SoC dipped below reserve!"
+
+
+import matplotlib.pyplot as plt
+
+# --- Plot objective function over iterations ---
+plt.figure(figsize=(10, 4))
+plt.plot(cost_trace, label="Objective Function")
+plt.xlabel("Iteration")
+plt.ylabel("Total Cost ($)")
+plt.title("Objective Function Value vs. Iteration")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# --- Plot charge amount per station vs. iteration ---
+q_trace_arr = np.array(q_trace)  # shape: (iterations, num_stations)
+plt.figure(figsize=(12, 6))
+for i in range(q_trace_arr.shape[1]):
+    plt.plot(q_trace_arr[:, i], label=f"Station {i+1}")
+plt.xlabel("Iteration")
+plt.ylabel("Charge Amount (kWh)")
+plt.title("Charge Decisions vs. Iteration")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
