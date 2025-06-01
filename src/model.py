@@ -69,7 +69,7 @@ num_stations     = len(stations_df)
 prices      = stations_df["Price_per_kWh"].values
 max_rate_kw = stations_df.get("Max_Charge_Rate_KW", stations_df.get("Max_Charge_Rate_kW")).values
 
-bounds = [(0.0, 4.0 * r) for r in max_rate_kw]
+bounds = [(0.0, 1.0 * r) for r in max_rate_kw]
 
 seg_to_stations = {}
 for st_idx, seg_idx in enumerate(station_segments):
@@ -87,6 +87,21 @@ for st_idx, seg_idx in enumerate(station_segments):
 if (B_START + np.cumsum(upper_energy_by_seg) - np.cumsum(E_used_seg)).min() < B_MIN:
     raise RuntimeError("Route infeasible: even max charging cannot keep SoC above reserve.")
 
+
+def q0(max_rate_kw):
+    np.random.seed(42)
+    upper_bounds = np.array(max_rate_kw)
+    q = np.random.uniform(low=0.0, high=upper_bounds)
+    return q
+
+q_trace = []
+cost_trace = []
+
+def track_q(q):
+    cost = total_cost(q)
+    q_trace.append(q.copy())
+    cost_trace.append(cost)
+    print(f"Iteration {len(q_trace)}: cost = {cost:.2f}, q = {q}")
 # ────────────────────────────────────────────────────────────────────────────────
 # 6.  Objective (continuous)
 # ────────────────────────────────────────────────────────────────────────────────
@@ -115,8 +130,8 @@ def total_cost(q: np.ndarray) -> float:
 # ────────────────────────────────────────────────────────────────────────────────
 # 7.  Optimisation (SLSQP)
 # ────────────────────────────────────────────────────────────────────────────────
-res = minimize(total_cost, np.zeros(num_stations), 
-               method="SLSQP", bounds=bounds, options={"disp": True, "maxiter": 50, "ftol":1e-5})
+res = minimize(total_cost, q0(max_rate_kw),#np.zeros(num_stations), 
+               method="SLSQP", bounds=bounds, callback=track_q, options={"disp": True, "maxiter": 50, "ftol":1e-5})
 if not res.success:
     raise RuntimeError("Optimization failed: " + res.message)
 q_opt = res.x
