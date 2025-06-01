@@ -10,7 +10,7 @@ prints:
 
 import pandas as pd
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, basinhopping
 from collections import defaultdict
 
 cost_trace = []
@@ -69,7 +69,7 @@ num_stations     = len(stations_df)
 prices      = stations_df["Price_per_kWh"].values
 max_rate_kw = stations_df.get("Max_Charge_Rate_KW", stations_df.get("Max_Charge_Rate_kW")).values
 
-bounds = [(0.0, 1.0 * r) for r in max_rate_kw]
+bounds = [(0.0, r) for r in max_rate_kw]
 
 seg_to_stations = {}
 for st_idx, seg_idx in enumerate(station_segments):
@@ -127,11 +127,24 @@ def total_cost(q: np.ndarray) -> float:
     q_trace.append(q.copy())
     return cost
 
+minimizer_kwargs = { 
+    "method": "SLSQP",
+    "bounds": bounds,
+    "options": {"disp": False, "maxiter": 1000, "ftol":1e-5}}
+
+res = basinhopping(
+    total_cost,
+    q0(max_rate_kw),
+    minimizer_kwargs=minimizer_kwargs,
+    niter=100,
+    stepsize=1.0,
+    seed=42
+)
 # ────────────────────────────────────────────────────────────────────────────────
 # 7.  Optimisation (SLSQP)
 # ────────────────────────────────────────────────────────────────────────────────
-res = minimize(total_cost, q0(max_rate_kw),#np.zeros(num_stations), 
-               method="SLSQP", bounds=bounds, callback=track_q, options={"disp": True, "maxiter": 50, "ftol":1e-5})
+# res = minimize(total_cost, q0(max_rate_kw),#np.zeros(num_stations), 
+#                method="SLSQP", bounds=bounds, callback=track_q, options={"disp": True, "maxiter": 50, "ftol":1e-5})
 if not res.success:
     raise RuntimeError("Optimization failed: " + res.message)
 q_opt = res.x
