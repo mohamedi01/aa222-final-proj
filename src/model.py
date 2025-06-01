@@ -89,10 +89,11 @@ if (B_START + np.cumsum(upper_energy_by_seg) - np.cumsum(E_used_seg)).min() < B_
 
 
 def q0(max_rate_kw):
-    np.random.seed(42)
+    np.random.seed(80)
     upper_bounds = np.array(max_rate_kw)
     q = np.random.uniform(low=0.0, high=upper_bounds)
     return q
+print("STATRTING POINT", q0(max_rate_kw))
 
 q_trace = []
 cost_trace = []
@@ -130,15 +131,15 @@ def total_cost(q: np.ndarray) -> float:
 minimizer_kwargs = { 
     "method": "SLSQP",
     "bounds": bounds,
-    "options": {"disp": False, "maxiter": 1000, "ftol":1e-5}}
+    "options": {"disp": False, "maxiter": 100, "ftol":1e-5}}
 
 res = basinhopping(
     total_cost,
     q0(max_rate_kw),
     minimizer_kwargs=minimizer_kwargs,
-    niter=100,
-    stepsize=1.0,
-    seed=42
+    niter=5,
+    stepsize=0.1,
+    seed=80
 )
 # ────────────────────────────────────────────────────────────────────────────────
 # 7.  Optimisation (SLSQP)
