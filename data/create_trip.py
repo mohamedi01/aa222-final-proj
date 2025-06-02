@@ -27,6 +27,8 @@ import openrouteservice as ors
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
+import osmnx as ox   
+import networkx as nx 
 
 # ────────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -88,7 +90,7 @@ def get_polyline(client: ors.Client):
     return data["features"][0]["geometry"]["coordinates"]  # list [lon, lat]
 
 
-def build_segments(coords: List[List[float]]) -> pd.DataFrame:
+def build_segments(coords: List[List[float]], G_drive: nx.DiGraph) -> pd.DataFrame:
     total_dist = sum(haversine_mi(coords[i], coords[i+1]) for i in range(len(coords)-1))
     target_mi  = total_dist / NUM_SEGMENTS
 
@@ -99,12 +101,30 @@ def build_segments(coords: List[List[float]]) -> pd.DataFrame:
         step_dist = haversine_mi(coords[i-1], coords[i])
         acc += step_dist
         if acc >= target_mi or i == len(coords)-1:
+            lon_mid, lat_mid = coords[i]
+            temp_f = fetch_temperature_f(lat_mid, lon_mid)
+            time.sleep(1)  # avoid hitting Open-Meteo too fast
+
+            # Snap to nearest OSM edge to get actual posted speed limit
+            u, v, key = ox.distance.nearest_edges(G_drive, lon_mid, lat_mid)
+            speed_kph = G_drive[u][v][key].get("speed_kph", 40)  # fallback 40 kph if missing
+            speed_mph = speed_kph * 0.621371
+
+            # Real elevation at segment start & end
+            lon_start, lat_start = coords[seg_start_idx]
+            lon_end,   lat_end   = coords[i]
+
+            elev_start_m = fetch_elevation_m(lat_start, lon_start)
+            time.sleep(0.5)  # throttle Open-Elevation
+            elev_end_m   = fetch_elevation_m(lat_end, lon_end)
+            elev_change_ft = round((elev_end_m - elev_start_m) * 3.28084)
+
             segments.append({
                 "Segment_ID": seg_id,
                 "Distance_mi": round(acc, 2),
-                "Speed_limit": random.choice([55, 65, 40]),
-                "Elevation_Change_ft": random.randint(-300, 300),
-                "Avg_Temp_F": round(random.uniform(40, 80), 1),
+                "Speed_limit": round(speed_mph),
+                "Elevation_Change_ft": elev_change_ft,
+                "Avg_Temp_F": round(temp_f, 1),
             })
             seg_id += 1
             acc = 0.0
@@ -126,6 +146,19 @@ def nrel_stations(lat: float, lon: float, radius=5) -> List[dict]:
         return retry_request(requests.get, url, timeout=10).json().get("fuel_stations", [])
     except Exception:
         return []
+
+def fetch_elevation_m(lat: float, lon: float) -> float:
+    """
+    Query the Open-Elevation API for elevation at (lat, lon) in meters.
+    If the call fails, return 0.0 as a fallback.
+    """
+    try:
+        url = f"https://api.open-elevation.com/api/v1/lookup?locations={lat:.5f},{lon:.5f}"
+        r = retry_request(requests.get, url, timeout=5)
+        data = r.json()
+        return float(data["results"][0]["elevation"])
+    except Exception:
+        return 0.0
 
 
 def build_chargers(segments_df: pd.DataFrame, coords: List[List[float]]) -> pd.DataFrame:
@@ -156,6 +189,29 @@ def build_chargers(segments_df: pd.DataFrame, coords: List[List[float]]) -> pd.D
     return pd.DataFrame(chargers)
 
 # ────────────────────────────────────────────────────────────────────────────────
+# Temperature (real via Open-Meteo)
+# ────────────────────────────────────────────────────────────────────────────────
+def fetch_temperature_f(lat: float, lon: float) -> float:
+    """
+    Query Open-Meteo for the current temperature (°C) at (lat, lon),
+    convert to °F, and return. If the request fails, fall back to 70°F.
+    """
+    try:
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat:.5f}&longitude={lon:.5f}"
+            "&current_weather=true&timezone=UTC"
+        )
+        r = requests.get(url, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        temp_c = data["current_weather"]["temperature"]
+        return temp_c * 9/5 + 32  # convert to °F
+    except Exception:
+        return 70.0  # fallback if something goes wrong
+
+
+# ────────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ────────────────────────────────────────────────────────────────────────────────
 
@@ -163,7 +219,24 @@ def main():
     client = ors.Client(key=ORS_API_KEY)
 
     coords = get_polyline(client)
-    seg_df = build_segments(coords)
+
+
+    # ────────────────────────────────────────────────────────────────────────────────
+    # 1b) Build OSMnx “drive” graph over the route’s bounding box
+    lons = [pt[0] for pt in coords]
+    lats = [pt[1] for pt in coords]
+    north, south = max(lats) + 0.01, min(lats) - 0.01
+    east,  west  = max(lons) + 0.01, min(lons) - 0.01
+
+    print("Downloading OSM graph for bbox:", north, south, east, west)
+    bbox = (north, south, east, west)
+    G_drive = ox.graph_from_bbox(bbox, network_type="drive")
+    G_drive = ox.add_edge_speeds(G_drive)
+    G_drive = ox.add_edge_travel_times(G_drive)
+
+    # ────────────────────────────────────────────────────────────────────────────────
+    # 2) Build segments, using real temp + posted speed limit
+    seg_df = build_segments(coords, G_drive)    # pass G_drive into build_segments
     seg_df.to_csv(out_dir / "route_segments.csv", index=False)
 
     st_df = build_chargers(seg_df, coords)
@@ -171,7 +244,7 @@ def main():
 
     pd.DataFrame({"Param": VEHICLE_PARAMS.keys(), "Value": VEHICLE_PARAMS.values()}).to_csv(out_dir / "vehicle_params.csv", index=False)
 
-    print("✅  Generated CSVs in", out_dir)
+    print("Generated CSVs in", out_dir)
 
 
 if __name__ == "__main__":

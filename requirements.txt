@@ -1,4 +1,6 @@
 openrouteservice==2.3.2
+osmnx==2.0.3
+networkx==3.4.2
 pandas==2.2.2
 numpy==1.26.4
 scipy==1.15.3

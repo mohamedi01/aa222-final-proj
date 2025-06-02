@@ -11,7 +11,6 @@ prints:
 import pandas as pd
 import numpy as np
 from scipy.optimize import minimize, basinhopping
-from collections import defaultdict
 
 cost_trace = []
 q_trace = []
@@ -35,6 +34,8 @@ SPEED_REF_MPH, SPEED_QUAD = 60, 0.002
 ELEV_UP_COEFF, ELEV_REGEN_EFF = 0.0003, 0.60
 TRAFFIC_SEED = 27
 REGEN_KWH_PER_MILE_AT_FULL_STOPGO = 0.05
+RANDOM_SEARCH_TRIALS = 100
+RANDOM_SEARCH = False
 
 # ────────────────────────────────────────────────────────────────────────────────
 # 3.  Traffic profile & per‑segment consumption
@@ -119,8 +120,10 @@ def total_cost(q: np.ndarray) -> float:
             cost    += charge * prices[st_idx]
 
         if battery < B_MIN:
+            if RANDOM_SEARCH: break
             cost += PENALTY * (B_MIN - battery)
         elif battery > B_MAX:
+            if RANDOM_SEARCH: break
             cost += PENALTY * (battery - B_MAX)
 
     cost += TIME_PENALTY * (np.sum(q / max_rate_kw)) ** 2
@@ -128,6 +131,191 @@ def total_cost(q: np.ndarray) -> float:
     q_trace.append(q.copy())
     return cost
 
+# rng = np.random.default_rng(99)
+# best_rand_cost = np.inf
+# best_rand_q    = None
+# RANDOM_SEARCH = True
+# for _ in range(RANDOM_SEARCH_TRIALS):
+#     q_rand = rng.uniform([b[0] for b in bounds], [b[1] for b in bounds])
+#     c_rand = total_cost(q_rand)
+#     if c_rand < best_rand_cost:
+#         best_rand_cost, best_rand_q = c_rand, q_rand
+# RANDOM_SEARCH = False
+# print(f"Random search best cost over {RANDOM_SEARCH_TRIALS} trials: {best_rand_cost:.2f}")
+# total kWh the wheels will consume
+#-------------------------------------------------------------------------------------------------------
+# choosing each charger in each segment
+energy_need = E_used_seg.sum()
+# net kWh that must be added through charging to finish at B_MIN
+required_kWh = max(0.0, energy_need + B_MIN - B_START)
+
+q_fixed = np.zeros(num_stations)
+capacities = np.array([b[1] for b in bounds])
+
+# total kWh the wheels will consume
+energy_need = E_used_seg.sum()
+# net kWh that must be added through charging to finish at B_MIN
+required_kWh = max(0.0, energy_need + B_MIN - B_START)
+
+q_fixed = np.zeros(num_stations)
+capacities = np.array([b[1] for b in bounds])
+
+if required_kWh > 0:
+    # initial even allocation
+    per_station = required_kWh / num_stations
+    q_fixed = np.minimum(per_station, capacities)
+    remaining = required_kWh - q_fixed.sum()
+
+    # distribute any leftover to stations that still have headroom
+    if remaining > 1e-9:
+        headroom = capacities - q_fixed
+        while remaining > 1e-9 and headroom.sum() > 0:
+            share = remaining / (headroom > 0).sum()
+            add = np.minimum(share, headroom)
+            q_fixed += add
+            remaining -= add.sum()
+            headroom = capacities - q_fixed
+
+fixed_cost = total_cost(q_fixed)
+print(f"Even‑distribution heuristic cost: {fixed_cost:.2f}")
+
+# SoC trace under even‑distribution plan
+battery_fixed = B_START
+soc_fixed_trace = []
+for seg_idx in range(n_segments):
+    battery_fixed -= E_used_seg[seg_idx]
+    for st_idx in seg_to_stations.get(seg_idx, []):
+        battery_fixed += q_fixed[st_idx]
+    soc_fixed_trace.append(battery_fixed)
+print("Heuristic SoC after each segment:", np.round(soc_fixed_trace, 2))
+
+# choosing the cheapest in a segment
+chosen_idx = []
+for seg in range(n_segments):
+    idxs = seg_to_stations.get(seg, [])
+    if idxs:                     # segment has at least one charger
+        cheapest = idxs[np.argmin(prices[idxs])]
+        chosen_idx.append(cheapest)
+
+if not chosen_idx:
+    raise RuntimeError("No stations selected by heuristic")
+
+chosen_idx = np.array(chosen_idx)
+n_chosen   = len(chosen_idx)
+
+# 2) total kWh we must add so arrival SoC == B_MIN
+required_kWh = max(0.0, B_MIN + E_used_seg.sum() - B_START)
+
+# 3) give every chosen station the same amount, capped by its max-rate bound
+capacities   = np.array([bounds[i][1] for i in chosen_idx])
+q_equal_seg  = np.zeros(num_stations)
+
+if required_kWh > 0:
+    per = required_kWh / n_chosen
+    per = min(per, capacities.min())        # respect tightest cap
+    q_equal_seg[chosen_idx] = per           # identical charge
+
+# 4) evaluate and report
+equal_cost = total_cost(q_equal_seg)
+print(f"\nOne-station-per-segment equal-share cost: {equal_cost:.2f}")
+
+# SoC trace for this heuristic
+soc_equal = []
+bat = B_START
+for s in range(n_segments):
+    bat -= E_used_seg[s]
+    for i in seg_to_stations.get(s, []):
+        bat += q_equal_seg[i]
+    soc_equal.append(bat)
+print("Heuristic SoC after each segment:", np.round(soc_equal, 2))
+
+
+# stopping only when about to run out of charge and 
+# charging a constant amount
+cheapest_idx = {seg: idxs[np.argmin(prices[idxs])]
+                for seg, idxs in seg_to_stations.items()}
+
+def simulate(dose):
+    """
+    Return (cost_no_penalty, final_soc, per-seg SoC list, q_vec) given a fixed charge `dose`.
+    We compute cost manually (no penalty), because we ensure SoC never dips below B_MIN.
+    If at any point soc < B_MIN and there is no station to charge, we mark infeasible by returning np.inf cost.
+    """
+    q_vec = np.zeros(num_stations)
+    soc   = B_START
+    soc_path = []
+    cost = 0.0
+
+    for seg in range(n_segments):
+        # Forecast post-drive SoC
+        future_soc = soc - E_used_seg[seg]
+
+        # If that would dip below B_MIN, charge first (if possible)
+        if future_soc < B_MIN:
+            if seg not in cheapest_idx:
+                # No station this segment → infeasible
+                return np.inf, future_soc, soc_path, q_vec
+
+            idx   = cheapest_idx[seg]
+            added = min(dose, bounds[idx][1])  # respect cap
+            q_vec[idx] += added
+            cost      += added * prices[idx]
+            soc       += added
+
+            # Recompute future_soc after topping up
+            future_soc = soc - E_used_seg[seg]
+
+        # Now apply the drive step
+        soc = future_soc
+
+        # Record SoC after this segment
+        soc_path.append(soc)
+
+    # After loop, soc ≥ B_MIN by construction
+    # Add the time penalty term (no other penalties)
+    cost += (np.sum(q_vec / max_rate_kw)) ** 2
+
+    return cost, soc, soc_path, q_vec
+
+# --------------- Bisection to find the best dose that ends SoC near B_MIN ---------------
+lo, hi = 0.0, max_rate_kw.min()
+best_q      = None
+best_diff   = np.inf
+best_soc_end = None
+best_soc_path = None
+
+for _ in range(25):
+    mid = 0.5 * (lo + hi)
+    cost_mid, soc_end, soc_mid_path, q_mid = simulate(mid)
+
+    if cost_mid == np.inf:
+        # infeasible dose → SoC dipped below B_MIN at some segment
+        lo = mid
+        continue
+
+    # track how close soc_end is to B_MIN
+    diff = abs(soc_end - B_MIN)
+    if diff < best_diff:
+        best_diff    = diff
+        best_q       = q_mid.copy()
+        best_soc_end = soc_end
+        best_soc_path = soc_mid_path.copy()
+
+    if soc_end > B_MIN:
+        # still overshooting → try smaller dose
+        hi = mid
+    else:
+        # undershooting → try larger dose
+        lo = mid
+
+if best_q is not None:
+    cost_fix = np.dot(best_q, prices) + (np.sum(best_q / max_rate_kw)) ** 2
+    print(f"\nFixed-dose heuristic cost: {cost_fix:.2f}  (final SoC = {best_soc_end:.2f} kWh)")
+    print("Heuristic SoC after each segment:\n", np.round(best_soc_path, 2))
+else:
+    print("\nFixed-dose heuristic: no feasible constant dose found.")
+
+#-------------------------------------------------------------------------------------------------------
 minimizer_kwargs = { 
     "method": "SLSQP",
     "bounds": bounds,
@@ -176,40 +364,40 @@ import matplotlib.pyplot as plt
 print(len(q_trace))
 print(len(cost_trace))
 
-plt.figure(figsize=(12, 12))
-# --- Plot objective function over iterations ---
-# plt.figure(figsize=(10, 4))
-plt.subplot(2, 1, 1)
-plt.plot(cost_trace, label="Objective Function")
-plt.xlabel("Iteration")
-plt.ylabel("Total Cost ($)")
-plt.title("Objective Function Value vs. Iteration")
-plt.grid(True)
-plt.legend()
+# plt.figure(figsize=(12, 12))
+# # --- Plot objective function over iterations ---
+# # plt.figure(figsize=(10, 4))
+# plt.subplot(2, 1, 1)
+# plt.plot(cost_trace, label="Objective Function")
+# plt.xlabel("Iteration")
+# plt.ylabel("Total Cost ($)")
+# plt.title("Objective Function Value vs. Iteration")
+# plt.grid(True)
+# plt.legend()
+# # plt.tight_layout()
+# # plt.show()
+
+# # --- Plot charge amount per station vs. iteration ---
+# q_trace_arr = np.array(q_trace)  # shape: (iterations, num_stations)
+# # plt.figure(figsize=(12, 6))
+# plt.subplot(2, 1, 2)
+# for i in range(q_trace_arr.shape[1]):
+#     plt.plot(q_trace_arr[:, i], label=f"Station {i+1}")
+# plt.xlabel("Iteration")
+# plt.ylabel("Charge Amount (kWh)")
+# plt.title("Charge Decisions vs. Iteration")
+# plt.grid(True)
+# plt.legend()
 # plt.tight_layout()
 # plt.show()
 
-# --- Plot charge amount per station vs. iteration ---
-q_trace_arr = np.array(q_trace)  # shape: (iterations, num_stations)
-# plt.figure(figsize=(12, 6))
-plt.subplot(2, 1, 2)
-for i in range(q_trace_arr.shape[1]):
-    plt.plot(q_trace_arr[:, i], label=f"Station {i+1}")
-plt.xlabel("Iteration")
-plt.ylabel("Charge Amount (kWh)")
-plt.title("Charge Decisions vs. Iteration")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-#Log
-plt.figure(figsize=(10, 4))
-plt.plot(np.log(cost_trace), label="Objective Function")
-plt.xlabel("Iteration")
-plt.ylabel("Total Cost ($)")
-plt.title("Objective Function Value vs. Iteration")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
-plt.show()
+# #Log
+# plt.figure(figsize=(10, 4))
+# plt.plot(np.log(cost_trace), label="Objective Function")
+# plt.xlabel("Iteration")
+# plt.ylabel("Total Cost ($)")
+# plt.title("Objective Function Value vs. Iteration")
+# plt.grid(True)
+# plt.legend()
+# plt.tight_layout()
+# plt.show()
