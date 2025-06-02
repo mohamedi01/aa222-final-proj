@@ -107,38 +107,36 @@ def track_q(q):
 # 6.  Objective (continuous)
 # ────────────────────────────────────────────────────────────────────────────────
 def get_soc_constraints():
+    """Return a list of SLSQP-style inequality constraints that keep the battery
+    between B_MIN and B_MAX on **every** segment (inclusive).  Each constraint
+    must be ≥ 0 for a feasible q-vector.
+    """
     constraints = []
-    
-    def make_battery_soc_fn(seg_idx_target):
-        def constraint_fn(q):
-            battery = B_START
-            for seg_idx in range(seg_idx_target + 1):
-                battery -= E_used_seg[seg_idx]
-                for st_idx in seg_to_stations.get(seg_idx, []):
-                    battery += q[st_idx]
-            return battery - B_MIN  # must be ≥ 0
-        return constraint_fn
 
-    # One constraint per segment: SoC ≥ B_MIN
+    # — helper: battery state-of-charge after driving/charging through segment i —
+    def soc_after_segment(i, q):
+        soc = B_START
+        for seg in range(i + 1):
+            soc -= E_used_seg[seg]                        # energy spent driving seg
+            for st in seg_to_stations.get(seg, []):       # energy added at any station(s)
+                soc += q[st]
+        return soc
+
+    # — per-segment SoC limits —
     for seg_idx in range(n_segments):
+        # lower bound  :  soc_i  −  B_MIN  ≥ 0
         constraints.append({
-            'type': 'ineq',
-            'fun': make_battery_soc_fn(seg_idx)
+            "type": "ineq",
+            "fun": lambda q, k=seg_idx: soc_after_segment(k, q) - B_MIN
+        })
+        # upper bound  :  B_MAX  −  soc_i  ≥ 0
+        constraints.append({
+            "type": "ineq",
+            "fun": lambda q, k=seg_idx: B_MAX - soc_after_segment(k, q)
         })
 
-    # Optional: Final SoC constraint (at the end of route)
-    def final_soc_constraint(q):
-        battery = B_START
-        for seg_idx in range(n_segments):
-            battery -= E_used_seg[seg_idx]
-            for st_idx in seg_to_stations.get(seg_idx, []):
-                battery += q[st_idx]
-        return battery - B_MIN  # again, SoC must be ≥ B_MIN
-
-    constraints.append({
-        'type': 'ineq',
-        'fun': final_soc_constraint
-    })
+    # (the loop already covers the final segment, so separate “final” constraints
+    # are no longer necessary—but if you like the redundancy, leave them here)
 
     return constraints
 
@@ -174,7 +172,7 @@ res = basinhopping(
     q0(max_rate_kw),
     minimizer_kwargs=minimizer_kwargs,
     niter=5,
-    stepsize=0.1,
+    stepsize=1,
     seed=80
 )
 # ────────────────────────────────────────────────────────────────────────────────
