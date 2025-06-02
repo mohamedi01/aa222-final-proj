@@ -27,7 +27,7 @@ route_df    = pd.read_csv("../data/route_segments.csv").sort_values("Segment_ID"
 # ────────────────────────────────────────────────────────────────────────────────
 B_MAX, B_MIN, B_START = 80.0, 10.0, 30.0
 PENALTY       = 1e5      # SoC violation
-TIME_PENALTY  = 1000    # weight for squared charging time
+TIME_PENALTY  = 1    # weight for squared charging time
 
 BASE_KWH_PER_MILE = 0.25
 TEMP_REF_F, TEMP_SLOPE = 70, 0.006
@@ -106,6 +106,41 @@ def track_q(q):
 # ────────────────────────────────────────────────────────────────────────────────
 # 6.  Objective (continuous)
 # ────────────────────────────────────────────────────────────────────────────────
+def get_soc_constraints():
+    constraints = []
+    
+    def make_battery_soc_fn(seg_idx_target):
+        def constraint_fn(q):
+            battery = B_START
+            for seg_idx in range(seg_idx_target + 1):
+                battery -= E_used_seg[seg_idx]
+                for st_idx in seg_to_stations.get(seg_idx, []):
+                    battery += q[st_idx]
+            return battery - B_MIN  # must be ≥ 0
+        return constraint_fn
+
+    # One constraint per segment: SoC ≥ B_MIN
+    for seg_idx in range(n_segments):
+        constraints.append({
+            'type': 'ineq',
+            'fun': make_battery_soc_fn(seg_idx)
+        })
+
+    # Optional: Final SoC constraint (at the end of route)
+    def final_soc_constraint(q):
+        battery = B_START
+        for seg_idx in range(n_segments):
+            battery -= E_used_seg[seg_idx]
+            for st_idx in seg_to_stations.get(seg_idx, []):
+                battery += q[st_idx]
+        return battery - B_MIN  # again, SoC must be ≥ B_MIN
+
+    constraints.append({
+        'type': 'ineq',
+        'fun': final_soc_constraint
+    })
+
+    return constraints
 
 def total_cost(q: np.ndarray) -> float:
     battery = B_START
@@ -118,10 +153,10 @@ def total_cost(q: np.ndarray) -> float:
             battery += charge
             cost    += charge * prices[st_idx]
 
-        if battery < B_MIN:
-            cost += PENALTY * (B_MIN - battery)
-        elif battery > B_MAX:
-            cost += PENALTY * (battery - B_MAX)
+        # if battery < B_MIN:
+        #     cost += PENALTY * (B_MIN - battery)
+        # elif battery > B_MAX:
+        #     cost += PENALTY * (battery - B_MAX)
 
     cost += TIME_PENALTY * (np.sum(q / max_rate_kw)) ** 2
     cost_trace.append(cost)
@@ -131,6 +166,7 @@ def total_cost(q: np.ndarray) -> float:
 minimizer_kwargs = { 
     "method": "SLSQP",
     "bounds": bounds,
+    "constraints": get_soc_constraints(),
     "options": {"disp": False, "maxiter": 100, "ftol":1e-5}}
 
 res = basinhopping(
